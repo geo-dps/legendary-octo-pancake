@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Эфемерные сообщения через Inline-режим.
+Формат: @botusername текст @username
 Бот ДОЛЖЕН быть администратором группы!
 """
 
@@ -47,15 +48,12 @@ async def is_bot_admin(bot, chat_id: int) -> bool:
 # ─── Поиск пользователя по username ──────────────────────────────
 
 async def find_user_by_username(bot, username: str, chat_id: int):
-    """
-    Находит пользователя по @username в чате.
-    Использует несколько методов для максимальной вероятности.
-    """
+    """Находит пользователя по @username в чате."""
     username = username.lstrip("@").lower()
     log.info(f"Поиск пользователя @{username} в чате {chat_id}")
     
     try:
-        # МЕТОД 1: Ищем среди администраторов
+        # Метод 1: Ищем среди администраторов
         admins = await bot.get_chat_administrators(chat_id)
         for admin in admins:
             user = admin.user
@@ -63,26 +61,22 @@ async def find_user_by_username(bot, username: str, chat_id: int):
                 log.info(f"Найден среди админов: {user.id}")
                 return user
         
-        # МЕТОД 2: Пробуем получить через get_chat_member
-        # Пробуем получить по username через get_chat (только для публичных)
+        # Метод 2: Через get_chat (для публичных пользователей)
         try:
             chat = await bot.get_chat(f"@{username}")
             if chat and chat.id:
-                # Проверяем, есть ли пользователь в чате
                 try:
                     member = await bot.get_chat_member(chat_id, chat.id)
                     if member:
                         log.info(f"Найден через get_chat: {member.user.id}")
                         return member.user
-                except Exception as e:
-                    log.debug(f"get_chat_member не сработал: {e}")
-        except Exception as e:
-            log.debug(f"get_chat не сработал: {e}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
-        # МЕТОД 3: Ищем через get_chat_members (только если есть права)
-        # Этот метод требует права "Смотреть список участников"
+        # Метод 3: Через get_chat_members (нужны права)
         try:
-            # Получаем до 200 участников (если группа большая)
             members = await bot.get_chat_members(chat_id, limit=200)
             for member in members:
                 user = member.user
@@ -93,7 +87,7 @@ async def find_user_by_username(bot, username: str, chat_id: int):
             log.debug(f"get_chat_members не сработал: {e}")
             
     except Exception as e:
-        log.error(f"Ошибка поиска пользователя @{username}: {e}")
+        log.error(f"Ошибка поиска: {e}")
     
     log.warning(f"Пользователь @{username} не найден")
     return None
@@ -104,16 +98,16 @@ async def on_inline_query(update: Update, context):
     query = update.inline_query
     text = query.query.strip()
     
-    log.info(f"Inline запрос: '{text}' от {query.from_user.id}")
+    log.info(f"Inline запрос: '{text}'")
     
     if not text:
         await query.answer([
             InlineQueryResultArticle(
                 id="help",
                 title="📨 Как использовать",
-                description="@ИмяБота @username текст",
+                description="@ИмяБота текст @username",
                 input_message_content=InputTextMessageContent(
-                    "Пример: @ИмяБота @john Привет!\n\n"
+                    "Пример: @MyBot Привет! @john\n\n"
                     "Бот должен быть администратором группы!"
                 ),
             )
@@ -123,7 +117,7 @@ async def on_inline_query(update: Update, context):
     # Ищем все @username
     mentions = re.findall(r"@(\w+)", text)
     
-    # Убираем имя бота
+    # Убираем имя бота из списка
     bot_info = await context.bot.get_me()
     bot_username = bot_info.username.lower()
     mentions = [m for m in mentions if m.lower() != bot_username]
@@ -133,24 +127,29 @@ async def on_inline_query(update: Update, context):
             InlineQueryResultArticle(
                 id="no_mention",
                 title="❌ Укажите получателя",
-                description="Напишите @username в запросе",
+                description="Напишите @username в конце",
                 input_message_content=InputTextMessageContent(
                     "❌ Не найден @username\n\n"
                     "Правильный формат:\n"
-                    "@ИмяБота @username Текст"
+                    "@ИмяБота Текст @username"
                 ),
             )
         ], cache_time=60)
         return
     
-    # Берем первого пользователя
-    username = mentions[0]
+    # Берем ПОСЛЕДНЕГО пользователя (тот, кто в конце)
+    username = mentions[-1]
     
-    # Извлекаем текст сообщения
-    pos = text.find(f"@{username}")
+    # Извлекаем текст сообщения (всё, что между ботом и @username)
+    # Находим позицию последнего упоминания
+    pos = text.rfind(f"@{username}")
     if pos != -1:
-        msg = text[pos + len(username) + 1:].strip()
-        message_text = msg if msg else f"Привет, @{username}!"
+        # Берем текст до последнего упоминания
+        before = text[:pos].strip()
+        # Удаляем имя бота из начала
+        if before.lower().startswith(f"@{bot_username}"):
+            before = before[len(bot_username) + 2:].strip()  # +2 для @ и пробела
+        message_text = before if before else f"Привет, @{username}!"
     else:
         message_text = f"Привет, @{username}!"
     
@@ -191,7 +190,7 @@ async def on_callback(update: Update, context):
     data = query.data
     chat_id = query.message.chat_id
     
-    log.info(f"Callback: {data} от {query.from_user.id}")
+    log.info(f"Callback: {data}")
     
     if not data.startswith("send:"):
         await query.answer()
@@ -206,18 +205,12 @@ async def on_callback(update: Update, context):
     
     username = saved['username']
     text = saved['text']
-    original_chat_id = saved.get('chat_id')
     
-    # Проверяем, что запрос из того же чата
-    if original_chat_id and original_chat_id != chat_id:
-        await query.answer("❌ Запрос из другого чата", show_alert=True)
-        return
-    
-    # Проверяем, админ ли бот
+    # Проверяем админа
     if not await is_bot_admin(context.bot, chat_id):
         await query.answer(
             "❌ Бот должен быть администратором!\n"
-            "Добавьте бота в админы и попробуйте снова.",
+            "Добавьте бота в админы.",
             show_alert=True
         )
         return
@@ -227,16 +220,12 @@ async def on_callback(update: Update, context):
     
     if not user:
         await query.answer(
-            f"❌ Пользователь @{username} не найден в чате\n\n"
-            f"Проверьте:\n"
-            f"• Пользователь есть в группе?\n"
-            f"• Правильно написано @{username}?\n"
-            f"• У бота есть права на просмотр участников?",
+            f"❌ Пользователь @{username} не найден в чате",
             show_alert=True
         )
         return
     
-    log.info(f"Найден пользователь: ID={user.id}, Username=@{user.username}, Name={user.first_name}")
+    log.info(f"Найден пользователь: {user.id} (@{user.username})")
     
     # Отправляем эфемерное сообщение
     try:
@@ -253,19 +242,19 @@ async def on_callback(update: Update, context):
         
         if result and result.get("ephemeral_message_id"):
             await query.answer("✅ Эфемерное сообщение отправлено!", show_alert=False)
-            log.info(f"Эфемерное сообщение отправлено пользователю {user.id}")
+            log.info(f"Эфемерное сообщение отправлено {user.id}")
         else:
-            # Если эфемерное не сработало, отправляем обычное с упоминанием
+            # Fallback: обычное сообщение с упоминанием
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"📨 **Сообщение для @{username}**\n\n{text}",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_to_message_id=query.message.message_id,
             )
-            await query.answer("⚠️ Отправлено как обычное сообщение (эфемерный режим не доступен)", show_alert=True)
+            await query.answer("⚠️ Отправлено как обычное (эфемерный режим не доступен)", show_alert=True)
             
     except Exception as e:
-        log.error(f"Ошибка отправки: {e}")
+        log.error(f"Ошибка: {e}")
         await query.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
     
     _data.pop(data_id, None)
@@ -275,14 +264,12 @@ async def on_callback(update: Update, context):
 async def cmd_start(update: Update, context):
     await update.message.reply_text(
         "👋 **Эфемерный бот**\n\n"
-        "**Как использовать:**\n"
-        "1️⃣ В поле ввода начните писать:\n"
-        "   `@ИмяБота @username текст`\n"
-        "2️⃣ Выберите появившуюся кнопку\n"
-        "3️⃣ Сообщение увидят только вы и @username\n\n"
+        "**Формат:**\n"
+        "`@ИмяБота Текст @username`\n\n"
+        "**Пример:**\n"
+        "`@MyBot Привет, как дела? @john`\n\n"
         "⚠️ **Бот должен быть администратором группы!**\n\n"
-        "📌 Пример:\n"
-        "`@MyBot @john Привет!`",
+        "📌 Сообщение увидят только вы и @username",
         parse_mode=ParseMode.MARKDOWN
     )
 
