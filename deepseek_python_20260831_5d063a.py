@@ -114,7 +114,7 @@ async def on_inline_query(update: Update, context):
                 description="Напишите @username в конце",
                 input_message_content=InputTextMessageContent(
                     "❌ Не найден @username\n\n"
-                    "Формат: @ИмяБота Текст @username"
+                    "Формат: @secretnobot Текст @username"
                 ),
             )
         ], cache_time=60)
@@ -230,9 +230,9 @@ async def cmd_start(update: Update, context):
     await update.message.reply_text(
         "👋 **Бот для приватных сообщений**\n\n"
         "**Формат:**\n"
-        "`@ИмяБота Текст @username`\n\n"
+        "`@secretnobot Привет @Verifure`\n\n"
         "**Пример:**\n"
-        "`@MyBot Привет, как дела? @john`\n\n"
+        "`@secretnobot Привет, как дела? @Verifure`\n\n"
         "📌 Сообщение увидят все, но с упоминанием @username",
         parse_mode=ParseMode.MARKDOWN
     )
