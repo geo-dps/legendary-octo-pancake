@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
 Эфемерные сообщения через Inline-режим.
-Поддерживает все возможные методы Telegram API.
-Формат: @botusername текст @username
+Поддерживает два формата:
+1. @botusername текст @username
+2. @botusername текст 123456789 (user_id)
+Команда /id показывает ID пользователя.
 """
 
 import logging
 import os
 import re
-import asyncio
 import uuid
-from typing import Optional, Dict, Any
 
 from telegram import (
     InlineKeyboardButton,
@@ -18,7 +18,6 @@ from telegram import (
     InlineQueryResultArticle,
     InputTextMessageContent,
     Update,
-    ChatPermissions,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -34,29 +33,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN не задан")
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-_data: Dict[str, Dict[str, Any]] = {}
-
-# ─── Проверка прав бота ──────────────────────────────────────────
-
-async def get_bot_permissions(bot, chat_id: int) -> dict:
-    """Получает права бота в чате."""
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(chat_id, me.id)
-        return {
-            'is_admin': member.status in ('administrator', 'creator'),
-            'can_delete_messages': False,
-            'can_restrict_members': False,
-        }
-    except Exception as e:
-        log.error(f"Ошибка получения прав: {e}")
-        return {'is_admin': False, 'can_delete_messages': False, 'can_restrict_members': False}
+_data = {}
 
 # ─── Поиск пользователя по username ──────────────────────────────
 
@@ -65,14 +45,14 @@ async def find_user_by_username(bot, username: str, chat_id: int):
     username = username.lstrip("@").lower()
     
     try:
-        # Метод 1: Среди администраторов
+        # Ищем среди администраторов
         admins = await bot.get_chat_administrators(chat_id)
         for admin in admins:
             user = admin.user
             if user.username and user.username.lower() == username:
                 return user
         
-        # Метод 2: Через get_chat (публичные пользователи)
+        # Через get_chat (для публичных)
         try:
             chat = await bot.get_chat(f"@{username}")
             if chat and chat.id:
@@ -85,9 +65,9 @@ async def find_user_by_username(bot, username: str, chat_id: int):
         except Exception:
             pass
         
-        # Метод 3: Через get_chat_members (нужны права)
+        # Через get_chat_members (нужны права)
         try:
-            members = await bot.get_chat_members(chat_id, limit=300)
+            members = await bot.get_chat_members(chat_id, limit=200)
             for member in members:
                 user = member.user
                 if user.username and user.username.lower() == username:
@@ -100,121 +80,36 @@ async def find_user_by_username(bot, username: str, chat_id: int):
     
     return None
 
-# ─── Отправка эфемерного сообщения ──────────────────────────────
+# ─── Команда /id ──────────────────────────────────────────────────
 
-async def send_ephemeral_message(
-    bot,
-    chat_id: int,
-    receiver_id: int,
-    text: str,
-    reply_to_id: Optional[int] = None,
-    callback_query_id: Optional[str] = None,
-) -> dict:
-    """
-    Пытается отправить эфемерное сообщение всеми возможными способами.
-    Возвращает результат с информацией о том, что сработало.
-    """
-    results = {
-        'success': False,
-        'method': None,
-        'message_id': None,
-        'ephemeral_id': None,
-    }
+async def cmd_id(update: Update, context):
+    """Показывает ID пользователя."""
+    message = update.message
     
-    # ─── СПОСОБ 1: receiver_user_id (Bot API 10.2+) ──────────────
-    try:
-        log.info("Попытка отправить через receiver_user_id...")
-        kw = {
-            "chat_id": chat_id,
-            "text": text,
-            "receiver_user_id": receiver_id,
-            "parse_mode": ParseMode.HTML,
-        }
-        if reply_to_id:
-            kw["reply_parameters"] = {"message_id": reply_to_id}
-        if callback_query_id:
-            kw["callback_query_id"] = callback_query_id
-        
-        result = await bot.do_api_request("sendMessage", api_kwargs=kw)
-        
-        if result and result.get("ephemeral_message_id"):
-            log.info(f"✅ receiver_user_id сработал! ephemeral_id={result['ephemeral_message_id']}")
-            results['success'] = True
-            results['method'] = 'receiver_user_id'
-            results['ephemeral_id'] = result['ephemeral_message_id']
-            results['message_id'] = result.get('message_id')
-            return results
-        else:
-            log.warning("receiver_user_id не вернул ephemeral_message_id")
-    except Exception as e:
-        log.warning(f"receiver_user_id не сработал: {e}")
-    
-    # ─── СПОСОБ 2: Обычное сообщение + удаление ──────────────────
-    try:
-        log.info("Попытка отправить с последующим удалением...")
-        
-        # Отправляем сообщение с упоминанием
-        msg = await bot.send_message(
-            chat_id=chat_id,
-            text=f"🔔 **Сообщение для @{receiver_id}**\n\n{text}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_to_message_id=reply_to_id,
+    # Если есть реплай — показываем ID того, на кого реплай
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+        text = (
+            f"🆔 **ID пользователя**\n\n"
+            f"👤 {target.first_name}"
+            f"{' (@' + target.username + ')' if target.username else ''}\n"
+            f"📌 `{target.id}`\n\n"
+            f"Используйте этот ID в inline-режиме:\n"
+            f"`@{context.bot.username} Привет! {target.id}`"
         )
-        
-        results['message_id'] = msg.message_id
-        
-        # Пытаемся удалить через некоторое время
-        async def delete_later():
-            await asyncio.sleep(2)
-            try:
-                await bot.delete_message(chat_id, msg.message_id)
-                log.info("✅ Сообщение удалено")
-            except Exception as e:
-                log.warning(f"Не удалось удалить сообщение: {e}")
-        
-        asyncio.create_task(delete_later())
-        
-        results['success'] = True
-        results['method'] = 'send_and_delete'
-        log.info("✅ Отправлено с последующим удалением")
-        return results
-        
-    except Exception as e:
-        log.error(f"Ошибка при отправке с удалением: {e}")
-    
-    # ─── СПОСОБ 3: Отправка в личные сообщения ──────────────────
-    try:
-        log.info("Попытка отправить в личные сообщения...")
-        await bot.send_message(
-            chat_id=receiver_id,
-            text=f"📨 **Сообщение из группы**\n\n{text}",
-            parse_mode=ParseMode.MARKDOWN,
+    else:
+        # Показываем ID самого пользователя
+        user = message.from_user
+        text = (
+            f"🆔 **Ваш ID**\n\n"
+            f"👤 {user.first_name}"
+            f"{' (@' + user.username + ')' if user.username else ''}\n"
+            f"📌 `{user.id}`\n\n"
+            f"Чтобы отправить эфемерное сообщение:\n"
+            f"`@{context.bot.username} Текст {user.id}`"
         )
-        results['success'] = True
-        results['method'] = 'private_message'
-        log.info("✅ Отправлено в личные сообщения")
-        return results
-    except Exception as e:
-        log.warning(f"Не удалось отправить в личные сообщения: {e}")
     
-    # ─── СПОСОБ 4: Обычное сообщение с упоминанием (fallback) ──
-    try:
-        log.info("Fallback: отправка с упоминанием...")
-        msg = await bot.send_message(
-            chat_id=chat_id,
-            text=f"📨 **Сообщение для @{receiver_id}**\n\n{text}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_to_message_id=reply_to_id,
-        )
-        results['success'] = True
-        results['method'] = 'mention_only'
-        results['message_id'] = msg.message_id
-        log.info("✅ Отправлено с упоминанием (fallback)")
-        return results
-    except Exception as e:
-        log.error(f"Все способы отправки не удались: {e}")
-    
-    return results
+    await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 # ─── Inline-обработчик ────────────────────────────────────────────
 
@@ -222,76 +117,110 @@ async def on_inline_query(update: Update, context):
     query = update.inline_query
     text = query.query.strip()
     
-    log.info(f"Inline запрос: '{text}' от {query.from_user.id}")
+    log.info(f"Inline запрос: '{text}'")
     
     if not text:
         await query.answer([
             InlineQueryResultArticle(
                 id="help",
                 title="📨 Как использовать",
-                description="@ИмяБота текст @username",
+                description="@ИмяБота текст @username или ID",
                 input_message_content=InputTextMessageContent(
-                    "Пример: @MyBot Привет! @john"
+                    "📌 **Форматы:**\n\n"
+                    "1️⃣ По username:\n"
+                    "`@bot текст @username`\n\n"
+                    "2️⃣ По ID:\n"
+                    "`@bot текст 123456789`\n\n"
+                    "💡 Получить ID: `/id` (ответом на сообщение)"
                 ),
+                parse_mode=ParseMode.MARKDOWN,
             )
         ], cache_time=60)
         return
     
-    # Ищем @username (кроме бота)
+    # Ищем все @username
     mentions = re.findall(r"@(\w+)", text)
+    
+    # Убираем имя бота
     bot_info = await context.bot.get_me()
     bot_username = bot_info.username.lower()
     mentions = [m for m in mentions if m.lower() != bot_username]
     
-    if not mentions:
+    # Ищем ID (числа в конце)
+    # Ищем последнее число в тексте
+    numbers = re.findall(r"\b(\d{5,})\b", text)
+    user_id = int(numbers[-1]) if numbers else None
+    
+    # Определяем, что у нас: username или ID
+    receiver_username = mentions[-1] if mentions else None
+    receiver_id = user_id
+    
+    # Если ничего не найдено
+    if not receiver_username and not receiver_id:
         await query.answer([
             InlineQueryResultArticle(
-                id="no_mention",
+                id="no_target",
                 title="❌ Укажите получателя",
-                description="Напишите @username в конце",
+                description="Напишите @username или ID в конце",
                 input_message_content=InputTextMessageContent(
-                    "❌ Не найден @username\n\n"
-                    "Формат: @ИмяБота Текст @username"
+                    "❌ Не найден @username или ID\n\n"
+                    "📌 **Форматы:**\n"
+                    "`@bot текст @username`\n"
+                    "`@bot текст 123456789`\n\n"
+                    "💡 Получить ID: `/id`"
                 ),
+                parse_mode=ParseMode.MARKDOWN,
             )
         ], cache_time=60)
         return
     
-    # Берем последнего пользователя
-    username = mentions[-1]
-    
-    # Извлекаем текст
-    pos = text.rfind(f"@{username}")
-    if pos != -1:
-        before = text[:pos].strip()
-        if before.lower().startswith(f"@{bot_username}"):
-            before = before[len(bot_username) + 2:].strip()
-        message_text = before if before else f"Привет, @{username}!"
+    # Извлекаем текст сообщения
+    # Если есть username
+    if receiver_username:
+        pos = text.rfind(f"@{receiver_username}")
+        if pos != -1:
+            before = text[:pos].strip()
+            if before.lower().startswith(f"@{bot_username}"):
+                before = before[len(bot_username) + 2:].strip()
+            message_text = before if before else f"Привет, @{receiver_username}!"
+        else:
+            message_text = f"Привет, @{receiver_username}!"
     else:
-        message_text = f"Привет, @{username}!"
+        # Если есть ID
+        pos = text.rfind(str(receiver_id))
+        if pos != -1:
+            before = text[:pos].strip()
+            if before.lower().startswith(f"@{bot_username}"):
+                before = before[len(bot_username) + 2:].strip()
+            message_text = before if before else f"Привет, пользователь {receiver_id}!"
+        else:
+            message_text = f"Привет, пользователь {receiver_id}!"
     
     data_id = str(uuid.uuid4())[:8]
     
     _data[data_id] = {
-        'username': username,
+        'username': receiver_username,
+        'user_id': receiver_id,
         'text': message_text,
         'chat_id': query.chat_id,
         'from_user_id': query.from_user.id,
     }
     
+    # Кнопка
+    label = f"@{receiver_username}" if receiver_username else f"ID {receiver_id}"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            f"📨 Отправить @{username}",
+            f"📨 Отправить {label}",
             callback_data=f"send:{data_id}"
         )]
     ])
     
     article = InlineQueryResultArticle(
         id=data_id,
-        title=f"📨 Отправить @{username}",
+        title=f"📨 Отправить {label}",
         description=f"{message_text[:50]}",
         input_message_content=InputTextMessageContent(
-            f"📨 **Сообщение для @{username}**\n\n"
+            f"📨 **Эфемерное сообщение для {label}**\n\n"
             f"Текст: {message_text}",
             parse_mode=ParseMode.MARKDOWN,
         ),
@@ -299,7 +228,7 @@ async def on_inline_query(update: Update, context):
     )
     
     await query.answer([article], cache_time=10)
-    log.info(f"Показан результат для @{username}")
+    log.info(f"Показан результат для {label}")
 
 # ─── Callback-обработчик ──────────────────────────────────────────
 
@@ -321,58 +250,84 @@ async def on_callback(update: Update, context):
         await query.answer("❌ Данные устарели", show_alert=True)
         return
     
-    username = saved['username']
+    username = saved.get('username')
+    user_id = saved.get('user_id')
     text = saved['text']
     
-    # Ищем пользователя
-    user = await find_user_by_username(context.bot, username, chat_id)
+    # Определяем получателя
+    target_user = None
+    target_id = None
     
-    if not user:
+    if user_id:
+        # Если есть ID — используем его
+        target_id = user_id
+        log.info(f"Используем ID: {target_id}")
+    elif username:
+        # Ищем пользователя по username
+        target_user = await find_user_by_username(context.bot, username, chat_id)
+        if target_user:
+            target_id = target_user.id
+            log.info(f"Найден пользователь: {target_id} (@{target_user.username})")
+    
+    if not target_id:
         await query.answer(
-            f"❌ Пользователь @{username} не найден в чате",
+            f"❌ Не удалось найти получателя\n\n"
+            f"{'Пользователь @' + username + ' не найден в чате' if username else 'ID не указан'}\n\n"
+            f"💡 Используйте `/id` чтобы узнать ID пользователя",
             show_alert=True
         )
         return
     
-    log.info(f"Найден пользователь: {user.id} (@{user.username})")
-    
     # Отправляем эфемерное сообщение
-    result = await send_ephemeral_message(
-        context.bot,
-        chat_id,
-        user.id,
-        text,
-        reply_to_id=query.message.message_id,
-        callback_query_id=query.id,
-    )
-    
-    if result['success']:
-        method_names = {
-            'receiver_user_id': '✅ Эфемерное (receiver_user_id)',
-            'send_and_delete': '✅ Отправлено и удалено',
-            'private_message': '✅ Отправлено в личные сообщения',
-            'mention_only': '✅ Отправлено с упоминанием',
-        }
-        await query.answer(method_names.get(result['method'], '✅ Отправлено!'), show_alert=False)
-    else:
-        await query.answer("❌ Не удалось отправить сообщение", show_alert=True)
+    try:
+        # Пробуем отправить эфемерное через callback_query
+        result = await context.bot.do_api_request(
+            "sendMessage",
+            api_kwargs={
+                "chat_id": chat_id,
+                "text": text,
+                "receiver_user_id": target_id,
+                "parse_mode": ParseMode.HTML,
+                "callback_query_id": query.id,
+            }
+        )
+        
+        if result and result.get("ephemeral_message_id"):
+            await query.answer("✅ Эфемерное сообщение отправлено!", show_alert=False)
+            log.info(f"Эфемерное сообщение отправлено {target_id}")
+        else:
+            # Если не получилось — отправляем обычное и удаляем
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📨 **Сообщение**\n\n{text}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            try:
+                await context.bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
+            await query.answer("✅ Отправлено!", show_alert=False)
+            
+    except Exception as e:
+        log.error(f"Ошибка: {e}")
+        await query.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
     
     _data.pop(data_id, None)
 
-# ─── Команда /start ─────────────────────────────────────────────────
+# ─── /start ────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context):
     await update.message.reply_text(
-        "👋 **Эфемерный бот v2**\n\n"
-        "**Формат:**\n"
-        "`@ИмяБота Текст @username`\n\n"
-        "**Пример:**\n"
-        "`@MyBot Привет, как дела? @john`\n\n"
-        "**Как это работает:**\n"
-        "1️⃣ Бот пытается отправить эфемерное сообщение\n"
-        "2️⃣ Если не получается — отправляет с упоминанием\n"
-        "3️⃣ Пытается удалить сообщение через 2 секунды\n\n"
-        "📌 Сообщение увидят все, но с упоминанием @username",
+        "👋 **Эфемерный бот**\n\n"
+        "📌 **Форматы:**\n\n"
+        "1️⃣ По username:\n"
+        "`@bot Текст @username`\n\n"
+        "2️⃣ По ID (рекомендуется):\n"
+        "`@bot Текст 123456789`\n\n"
+        "💡 **Как узнать ID:**\n"
+        "• `/id` — ваш ID\n"
+        "• `/id` (ответом на сообщение) — ID пользователя\n\n"
+        "⚠️ Бот должен быть **администратором** группы!",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -382,6 +337,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(InlineQueryHandler(on_inline_query))
     app.add_handler(CallbackQueryHandler(on_callback))
     
