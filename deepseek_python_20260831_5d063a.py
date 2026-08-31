@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
 Эфемерные сообщения через Inline-режим.
-Пользователь вводит @ИмяБота @username текст → появляется кнопка.
-При нажатии → эфемерное сообщение в группе видит только @username.
+Простая и рабочая версия.
 """
 
 import logging
 import os
 import re
 import uuid
-from typing import Optional
 
 from telegram import (
     InlineKeyboardButton,
@@ -19,34 +17,26 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     InlineQueryHandler,
-    filters,
 )
 
-# ─── Конфиг ─────────────────────────────────────────────────────────
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN не задан")
 
-# ─── Логирование ────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("ephemeral_bot")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
-# Хранилище данных для Inline-запросов
-_ephemeral_data: dict = {}
+# Хранилище данных
+_data = {}
 
-# ─── Эфемерные сообщения ──────────────────────────────────────────
+# ─── Проверка админа ──────────────────────────────────────────────
 
-async def is_bot_chat_admin(bot, chat_id: int) -> bool:
-    """Проверяет, является ли бот администратором чата."""
+async def is_bot_admin(bot, chat_id: int) -> bool:
     try:
         me = await bot.get_me()
         member = await bot.get_chat_member(chat_id, me.id)
@@ -54,275 +44,231 @@ async def is_bot_chat_admin(bot, chat_id: int) -> bool:
     except Exception:
         return False
 
-async def send_ephemeral(
-    bot,
-    chat_id: int,
-    receiver_user_id: int,
-    text: str,
-    reply_markup=None,
-    reply_to_id: int = None,
-    parse_mode=ParseMode.HTML,
-    callback_query_id: str = None,
-) -> Optional[dict]:
-    """
-    Отправить эфемерное сообщение (видно только receiver_user_id).
-    """
-    # Проверяем, админ ли бот
-    bot_is_admin = await is_bot_chat_admin(bot, chat_id)
-    if not bot_is_admin and not callback_query_id:
-        log.debug("Бот не админ и нет callback_query_id")
-        return None
+# ─── Поиск пользователя ───────────────────────────────────────────
 
-    kw = {
-        "chat_id": chat_id,
-        "text": text,
-        "receiver_user_id": receiver_user_id,
-        "parse_mode": parse_mode,
-    }
-    if callback_query_id:
-        kw["callback_query_id"] = callback_query_id
-    if reply_to_id:
-        kw["reply_parameters"] = {"message_id": reply_to_id}
-    if reply_markup:
-        try:
-            kw["reply_markup"] = reply_markup.to_dict()
-        except Exception:
-            pass
-
-    try:
-        result = await bot.do_api_request("sendMessage", api_kwargs=kw)
-        if isinstance(result, dict) and result.get("ephemeral_message_id"):
-            log.info(f"Эфемерное сообщение отправлено: {result.get('ephemeral_message_id')}")
-            return result
-        log.debug("Сервер не вернул ephemeral_message_id")
-        return None
-    except Exception as e:
-        log.debug(f"send_ephemeral не удался: {e}")
-        return None
-
-# ─── Поиск пользователя по username ──────────────────────────────
-
-async def resolve_username(bot, username: str, chat_id: int) -> Optional[int]:
-    """
-    Пытается найти user_id по username в чате.
-    """
-    # Убираем @ если есть
-    username = username.lstrip("@")
+async def find_user_by_username(bot, username: str, chat_id: int):
+    """Находит пользователя по @username в чате."""
+    username = username.lstrip("@").lower()
     
     try:
-        # Пробуем получить участника по username через get_chat_member
-        # Это работает только если пользователь есть в чате
-        members = await bot.get_chat_administrators(chat_id)
-        for member in members:
-            user = member.user
-            if user.username and user.username.lower() == username.lower():
-                return user.id
+        # Пробуем найти среди участников
+        admins = await bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            if admin.user.username and admin.user.username.lower() == username:
+                return admin.user
         
-        # Если не нашли среди админов, пробуем через get_chat
-        # (не работает для обычных пользователей)
-        # Вместо этого попробуем через get_chat_member с username?
-        # Нет, get_chat_member требует user_id.
-        
-        # Последний способ: используем get_chat для публичных пользователей
-        # Но это не всегда работает
+        # Пробуем получить по username (работает для публичных пользователей)
         try:
             chat = await bot.get_chat(f"@{username}")
             if chat and chat.id:
-                return chat.id
+                # Проверяем, есть ли в чате
+                try:
+                    member = await bot.get_chat_member(chat_id, chat.id)
+                    if member:
+                        return member.user
+                except Exception:
+                    pass
         except Exception:
             pass
-            
     except Exception as e:
-        log.debug(f"resolve_username ошибка: {e}")
+        log.error(f"Ошибка поиска: {e}")
     
     return None
 
-# ─── Inline-обработчик ─────────────────────────────────────────────
+# ─── Inline-обработчик ────────────────────────────────────────────
 
-async def on_inline_query(update: Update, context) -> None:
-    """
-    При inline-запросе @BotName текст анализируется.
-    Если найдено упоминание пользователя (@username), показываем кнопку.
-    """
+async def on_inline_query(update: Update, context):
     query = update.inline_query
-    q_text = (query.query or "").strip()
+    text = query.query.strip()
     
-    # Если запрос пустой — ничего не показываем
-    if not q_text:
-        await query.answer([], cache_time=60, is_personal=True)
-        return
-
-    log.info(f"Inline-запрос: {q_text} от {query.from_user.id} в чате {query.chat_id}")
-
-    # Ищем упоминание: @username
-    mention_match = re.search(r"@(\w+)", q_text)
-    username = mention_match.group(1) if mention_match else None
-
-    # Если есть @username, но это имя самого бота — игнорируем
-    if username:
-        bot_info = await context.bot.get_me()
-        if username.lower() == bot_info.username.lower():
-            # Пользователь упомянул бота, но не указал получателя
-            # Показываем подсказку
-            article = InlineQueryResultArticle(
+    log.info(f"Inline запрос: '{text}' от {query.from_user.id}")
+    
+    # Если запрос пустой — показываем справку
+    if not text:
+        await query.answer([
+            InlineQueryResultArticle(
                 id="help",
-                title="📨 Укажите получателя",
-                description="Напишите: @ИмяБота @username текст",
+                title="📨 Как использовать",
+                description="@ИмяБота @username текст",
                 input_message_content=InputTextMessageContent(
-                    "Пример использования:\n"
-                    "`@ИмяБота @username Привет!`\n\n"
-                    "После выбора этой подсказки введите правильный запрос.",
-                    parse_mode=ParseMode.MARKDOWN,
+                    "Пример: @ИмяБота @john Привет!\n\n"
+                    "После выбора этого сообщения начните ввод заново."
                 ),
             )
-            await query.answer([article], cache_time=60, is_personal=True)
-            return
-
-    if not username:
-        # Если нет @username, не показываем результат
-        await query.answer([], cache_time=60, is_personal=True)
+        ], cache_time=60)
         return
-
-    # Получаем текст сообщения (всё, что после @username)
-    pos = q_text.find(f"@{username}")
-    if pos != -1:
-        msg_text = q_text[pos + len(username) + 1:].strip()
+    
+    # Ищем все @username в тексте
+    mentions = re.findall(r"@(\w+)", text)
+    
+    # Убираем имя бота
+    bot_info = await context.bot.get_me()
+    bot_username = bot_info.username.lower()
+    mentions = [m for m in mentions if m.lower() != bot_username]
+    
+    if not mentions:
+        # Нет упоминаний
+        await query.answer([
+            InlineQueryResultArticle(
+                id="no_mention",
+                title="❌ Укажите получателя",
+                description="Напишите @username в запросе",
+                input_message_content=InputTextMessageContent(
+                    "❌ Не найден @username\n\n"
+                    "Правильный формат:\n"
+                    "@ИмяБота @username Текст"
+                ),
+            )
+        ], cache_time=60)
+        return
+    
+    # Берем первого пользователя
+    username = mentions[0]
+    
+    # Извлекаем текст сообщения
+    # Находим позицию первого упоминания пользователя
+    for mention in mentions:
+        pos = text.find(f"@{mention}")
+        if pos != -1:
+            # Текст после упоминания
+            msg = text[pos + len(mention) + 1:].strip()
+            if msg:
+                message_text = msg
+                break
     else:
-        msg_text = q_text
-
-    if not msg_text:
-        msg_text = "Привет! Это эфемерное сообщение."
-
-    # Создаём уникальный ID для этого запроса
-    result_id = str(uuid.uuid4())[:8]
-
+        message_text = f"Привет, @{username}!"
+    
+    # Создаем уникальный ID
+    data_id = str(uuid.uuid4())[:8]
+    
     # Сохраняем данные
-    _ephemeral_data[result_id] = {
-        'receiver_username': username,
-        'text': msg_text,
+    _data[data_id] = {
+        'username': username,
+        'text': message_text,
         'chat_id': query.chat_id,
-        'from_user_id': query.from_user.id,
+        'from_user': query.from_user.id,
     }
-
-    # Кнопка для отправки
+    
+    # Создаем кнопку
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"📨 Отправить @{username}",
-            callback_data=f"ephem_send:{result_id}"
+            callback_data=f"send:{data_id}"
         )]
     ])
-
-    # Создаём статью с результатом
+    
+    # Создаем результат
     article = InlineQueryResultArticle(
-        id=result_id,
-        title=f"📨 Отправить эфемерное сообщение @{username}",
-        description=f"Только для @{username}",
+        id=data_id,
+        title=f"📨 Отправить @{username}",
+        description=f"{message_text[:50]}",
         input_message_content=InputTextMessageContent(
-            f"📨 Нажмите кнопку, чтобы отправить сообщение **@{username}**\n\n"
-            f"Сообщение: {msg_text[:100]}{'...' if len(msg_text) > 100 else ''}",
+            f"📨 **Эфемерное сообщение для @{username}**\n\n"
+            f"Текст: {message_text}",
             parse_mode=ParseMode.MARKDOWN,
         ),
         reply_markup=kb,
     )
+    
+    await query.answer([article], cache_time=10)
+    log.info(f"Показан результат для @{username}")
 
-    await query.answer([article], cache_time=10, is_personal=True)
-    log.info(f"Inline-результат показан для {username}")
+# ─── Callback-обработчик ──────────────────────────────────────────
 
-# ─── Callback-обработчик ───────────────────────────────────────────
-
-async def on_callback(update: Update, context) -> None:
+async def on_callback(update: Update, context):
     query = update.callback_query
     data = query.data
     chat_id = query.message.chat_id
-    from_user = query.from_user
-
-    log.info(f"Callback: {data} от {from_user.id}")
-
-    if not data.startswith("ephem_send:"):
+    
+    log.info(f"Callback: {data}")
+    
+    if not data.startswith("send:"):
         await query.answer()
         return
-
-    result_id = data.split(":", 1)[1]
-    data_dict = _ephemeral_data.get(result_id)
     
-    if not data_dict:
-        await query.answer("❌ Данные устарели, попробуйте снова.", show_alert=True)
-        return
-
-    receiver_username = data_dict.get('receiver_username')
-    text = data_dict.get('text', "Привет!")
-    original_chat_id = data_dict.get('chat_id')
-
-    # Проверяем, что чат совпадает
-    if original_chat_id != chat_id:
-        await query.answer("❌ Этот запрос был сделан в другом чате.", show_alert=True)
-        return
-
-    # Находим user_id по username
-    receiver_id = await resolve_username(context.bot, receiver_username, chat_id)
+    data_id = data.split(":", 1)[1]
+    saved = _data.get(data_id)
     
-    if not receiver_id:
+    if not saved:
+        await query.answer("❌ Данные устарели", show_alert=True)
+        return
+    
+    username = saved['username']
+    text = saved['text']
+    
+    # Проверяем админа
+    if not await is_bot_admin(context.bot, chat_id):
         await query.answer(
-            f"❌ Не удалось найти пользователя @{receiver_username} в этом чате.\n"
-            f"Убедитесь, что он есть в чате.",
+            "❌ Бот должен быть администратором!\n"
+            "Добавьте бота в админы и попробуйте снова.",
             show_alert=True
         )
         return
-
-    # Проверяем, админ ли бот
-    bot_is_admin = await is_bot_chat_admin(context.bot, chat_id)
-    if not bot_is_admin:
+    
+    # Ищем пользователя
+    user = await find_user_by_username(context.bot, username, chat_id)
+    
+    if not user:
         await query.answer(
-            "❌ Бот должен быть администратором чата для отправки эфемерных сообщений.",
+            f"❌ Пользователь @{username} не найден в чате",
             show_alert=True
         )
         return
-
+    
     # Отправляем эфемерное сообщение
-    result = await send_ephemeral(
-        context.bot,
-        chat_id,
-        receiver_id,
-        text,
-        reply_to_id=query.message.message_id,
-        parse_mode=ParseMode.HTML,
-        callback_query_id=query.id,
-    )
-
-    if result:
-        await query.answer("✅ Сообщение отправлено!", show_alert=False)
-        # Удаляем данные из памяти
-        _ephemeral_data.pop(result_id, None)
-    else:
-        await query.answer(
-            "❌ Не удалось отправить эфемерное сообщение.\n"
-            "Возможно, функция не поддерживается сервером Telegram.",
-            show_alert=True
+    try:
+        result = await context.bot.do_api_request(
+            "sendMessage",
+            api_kwargs={
+                "chat_id": chat_id,
+                "text": text,
+                "receiver_user_id": user.id,
+                "parse_mode": ParseMode.HTML,
+                "callback_query_id": query.id,
+            }
         )
+        
+        if result and result.get("ephemeral_message_id"):
+            await query.answer("✅ Отправлено!", show_alert=False)
+            log.info(f"Эфемерное сообщение отправлено {user.id}")
+        else:
+            await query.answer(
+                "⚠️ Отправлено, но без эфемерного режима",
+                show_alert=True
+            )
+            
+    except Exception as e:
+        log.error(f"Ошибка: {e}")
+        await query.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+    
+    _data.pop(data_id, None)
 
-# ─── Команда /start ─────────────────────────────────────────────────
+# ─── /start ────────────────────────────────────────────────────────
 
-async def cmd_start(update: Update, context) -> None:
+async def cmd_start(update: Update, context):
     await update.message.reply_text(
-        "👋 Привет!\n\n"
-        "Используй меня в группе через Inline-режим:\n"
-        "1️⃣ Напиши в поле ввода: `@ИмяБота @username текст`\n"
-        "2️⃣ Выбери появившуюся кнопку\n"
-        "3️⃣ Я отправлю эфемерное сообщение только указанному пользователю\n\n"
-        "⚠️ Бот должен быть **администратором** группы!\n"
-        "📌 Пример: `@MyBot @John Привет, как дела?`"
+        "👋 **Эфемерный бот**\n\n"
+        "**Как использовать:**\n"
+        "1️⃣ В поле ввода начните писать:\n"
+        "   `@ИмяБота @username текст`\n"
+        "2️⃣ Выберите появившуюся кнопку\n"
+        "3️⃣ Сообщение увидят только вы и @username\n\n"
+        "⚠️ Бот должен быть **администратором** группы!\n\n"
+        "📌 Пример:\n"
+        "`@MyBot @john Привет!`",
+        parse_mode=ParseMode.MARKDOWN
     )
 
 # ─── Запуск ─────────────────────────────────────────────────────────
 
-def main() -> None:
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(InlineQueryHandler(on_inline_query))
     app.add_handler(CallbackQueryHandler(on_callback))
-
-    log.info("🚀 Бот запущен. Ожидаем inline-запросы...")
+    
+    log.info("🚀 Бот запущен")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
